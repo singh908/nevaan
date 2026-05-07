@@ -1,0 +1,17 @@
+<!-- Kinetica DataSource via isolated classloader -->
+<bean id="kineticaDataSource"
+      class="com.bnpparibas.mrx.be.dwl.config.KineticaDataSourceFactory"
+      lazy-init="true">
+
+    <property name="driverJarPath"
+              value="/apps/mrx/DWL/lib/kinetica-jdbc-7.2.3.17.jar"/>
+    <property name="gpudbJarPath"
+              value="/apps/mrx/DWL/lib/gpudb-api-7.2.3.17.jar"/>
+    <property name="jdbcUrl"
+              value="${kinetica.jdbc.url}"/>
+    <property name="username"
+              value="${kinetica.db.username}"/>
+    <property name="password"
+              value="${kinetica.db.password}"/>
+    <property name="maxTotal" value="5"/>
+</bean>
