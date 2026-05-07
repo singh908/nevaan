@@ -1,0 +1,37 @@
+Why it worked in a simple test app
+When tested with a minimal Spring Boot app containing only a REST controller and the Kinetica JDBC driver — no Kafka SSL, no AWS S3 TLS — the application started without issues. This is because without SSL operations, the JFR security hook never fires, the broken ThreadTracker is never touched, and the crash path is never reached.
+Why Java 11 was never affected
+In Java 11, JarFile$ThreadTrackHolder, URL$ThreadTrackHolder, jdk.internal.misc.ThreadTracker, and JCAUtil.tryCommitCertEvent simply do not exist. The entire crash path is impossible.
+
+Investigation Steps Taken
+Over the course of this investigation we:
+
+Decompiled com.kinetica.jdbc.Driver — confirmed the driver class itself is clean. Its static initialiser only calls DriverManager.registerDriver(). The driver code is not the direct cause.
+Ran mvn dependency:tree — confirmed your driver pulls in bcprov-jdk15on:1.68 and bcpkix-jdk15on:1.68 as transitive runtime dependencies.
+Tried multiple workarounds — --add-opens JVM flags, Maven exclusions of Bouncy Castle and other transitive dependencies, JVM flag -Djdk.jar.maxParallelThreads=0. None fully resolved the issue.
+Confirmed root cause — removing only kinetica-jdbc-7.2.3.17.jar and gpudb-api-7.2.3.17.jar from the classpath while retaining all other libraries including Bouncy Castle allowed the application to start cleanly on Java 21. This proves the crash is triggered specifically by the combination of your driver's ServiceLoader auto-registration and the Bouncy Castle JCE provider registration on Java 21.
+
+
+Our Workaround — How We Fixed It
+Since we cannot downgrade our enterprise application from Java 21, we implemented an isolated ClassLoader solution:
+
+Marked kinetica-jdbc as <scope>provided</scope> in Maven — so neither kinetica-jdbc-7.2.3.17.jar nor gpudb-api-7.2.3.17.jar nor their transitive dependencies (Bouncy Castle, Jackson, Logback etc.) appear on the main application classpath.
+Placed the Kinetica shaded JAR in a separate directory outside the main classpath (/apps/mrx/DWL/kinetica/).
+Created a Spring FactoryBean (KineticaDataSourceFactory) that at Spring startup:
+
+Opens the shaded JAR via URLClassLoader with ClassLoader.getPlatformClassLoader() as parent — completely isolated from the application classloader.
+Loads com.kinetica.jdbc.Driver inside that isolated loader.
+Wraps it in a DriverShim to bridge the classloader boundary.
+Creates the MrxBasicDataSource connection pool using setDriver(shim) — bypassing Class.forName(driverClassName) entirely.
+
+
+With the Kinetica JARs off the main classpath:
+
+ServiceLoader finds no Kinetica driver at JVM bootstrap.
+No Bouncy Castle jdk15on JCE provider is registered at JVM startup.
+ThreadTracker initialises cleanly.
+Kafka SSL, AWS S3 TLS, and Kinetica JDBC all work together on Java 21. ✅
+
+
+
+The application is now running successfully on Java 21.0.10 with Kinetica JDBC queries functioning correctly.
