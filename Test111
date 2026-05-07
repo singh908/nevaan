@@ -1,0 +1,48 @@
+<!--
+    Kinetica DataSource — loaded from isolated ClassLoader.
+    JAR is NOT on main classpath (provided scope in Maven).
+    This avoids the Java 21 ThreadTracker race condition caused
+    by Bouncy Castle JCE provider + ServiceLoader auto-registration.
+-->
+<bean id="kineticaDataSource"
+      class="com.bnpparibas.mrx.be.dwl.config.KineticaDataSourceFactory">
+
+    <!-- Path to shaded JAR — NOT in main lib folder -->
+    <property name="jarPath" value="${KINETICA_JAR_PATH}"/>
+
+    <!-- Connection — same values as before -->
+    <property name="url"
+        value="jdbc:kinetica:${JDBC_KINETICA_HOST}:${JDBC_KINETICA_PORT}"/>
+    <property name="username"  value="${JDBC_KINETICA_USER_ADM}"/>
+    <property name="password"  value="${JDBC_KINETICA_PASSWORD_ADM}"/>
+    <property name="defaultAutoCommit"          value="true"/>
+    <property name="defaultTransactionIsolation" value="1"/>
+
+    <!-- Kinetica-specific connection properties -->
+    <property name="connectionProperties">
+        <props>
+            <prop key="JCONNECT_VERSION">6</prop>
+            <prop key="HOSTNAME">${JDBC_KINETICA_HOST}</prop>
+            <prop key="APPLICATIONNAME">
+                ${MRX_APP_NAME}_${MRX_APP_INSTANCE}
+            </prop>
+        </props>
+    </property>
+
+    <!-- Pool config — same values as before -->
+    <property name="maxTotal"   value="${jdbc.cons.number.iq}"/>
+    <property name="maxIdle"    value="${jdbc.cons.number.iq}"/>
+    <property name="minIdle"    value="0"/>
+    <property name="initialSize" value="${jdbc.cons.number.iq}"/>
+    <property name="maxWaitMillis"             value="-1"/>
+    <property name="poolPreparedStatements"    value="true"/>
+    <property name="maxOpenPreparedStatements" value="-1"/>
+    <property name="testOnBorrow"              value="true"/>
+    <property name="testOnReturn"              value="true"/>
+    <property name="timeBetweenEvictionRunsMillis" value="-1"/>
+    <property name="numTestsPerEvictionRun"    value="3"/>
+    <property name="minEvictableIdleTimeMillis" value="1800000"/>
+    <property name="testWhileIdle"             value="false"/>
+    <property name="validationQuery"
+              value="SELECT CURRENT_SCHEMA"/>
+</bean>
