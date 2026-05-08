@@ -1,0 +1,124 @@
+package com.bnpparibas.mrx.be.dwl.config;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.InitializingBean;
+
+import java.io.File;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.sql.*;
+import java.util.Properties;
+import java.util.logging.Logger;
+
+public class KineticaDriverManager
+        implements InitializingBean, DisposableBean {
+
+    private static final Logger log =
+        LoggerFactory.getLogger(KineticaDriverManager.class);
+
+    private String jarPath;
+
+    private URLClassLoader kineticaClassLoader;
+    private Driver         kineticaDriver;
+
+    // ── Spring lifecycle ──────────────────────────────────────
+    @Override
+    public void afterPropertiesSet() throws Exception {
+
+        File jar = new File(jarPath);
+        if (!jar.exists()) {
+            throw new IllegalStateException(
+                "Kinetica JAR not found at: " + jarPath);
+        }
+
+        log.info("Loading Kinetica driver ONCE from: {}", jarPath);
+
+        // Isolated classloader — NOT the app classloader
+        kineticaClassLoader = new URLClassLoader(
+            new URL[]{ jar.toURI().toURL() },
+            ClassLoader.getPlatformClassLoader()
+        );
+
+        Class<?> driverClass = Class.forName(
+            "com.kinetica.jdbc.Driver", true, kineticaClassLoader);
+
+        kineticaDriver = (Driver) driverClass
+            .getDeclaredConstructor()
+            .newInstance();
+
+        log.info("Kinetica driver v{}.{} ready — shared across all datasources",
+            kineticaDriver.getMajorVersion(),
+            kineticaDriver.getMinorVersion());
+    }
+
+    // Called by each KineticaDataSourceFactory
+    // Returns a new DriverShim wrapping the SAME underlying driver
+    public Driver getDriver() {
+        if (kineticaDriver == null) {
+            throw new IllegalStateException(
+                "Kinetica driver not initialised");
+        }
+        return new DriverShim(kineticaDriver);
+    }
+
+    @Override
+    public void destroy() throws Exception {
+        if (kineticaClassLoader != null) {
+            kineticaClassLoader.close();
+            log.info("Kinetica classloader closed");
+        }
+    }
+
+    public void setJarPath(String jarPath) {
+        this.jarPath = jarPath;
+    }
+
+    // ── DriverShim ────────────────────────────────────────────
+    private static final class DriverShim implements Driver {
+
+        private final Driver delegate;
+
+        DriverShim(Driver delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Connection connect(String url, Properties info)
+                throws SQLException {
+            return delegate.connect(url, info);
+        }
+
+        @Override
+        public boolean acceptsURL(String url) throws SQLException {
+            return delegate.acceptsURL(url);
+        }
+
+        @Override
+        public DriverPropertyInfo[] getPropertyInfo(
+                String url, Properties info) throws SQLException {
+            return delegate.getPropertyInfo(url, info);
+        }
+
+        @Override
+        public int getMajorVersion() {
+            return delegate.getMajorVersion();
+        }
+
+        @Override
+        public int getMinorVersion() {
+            return delegate.getMinorVersion();
+        }
+
+        @Override
+        public boolean jdbcCompliant() {
+            return delegate.jdbcCompliant();
+        }
+
+        @Override
+        public Logger getParentLogger() {
+            return null;
+        }
+    }
+}w
