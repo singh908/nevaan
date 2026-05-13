@@ -1,0 +1,152 @@
+3. You added NMT (line 114), which conflicts with your "conservative overhead" goal. NativeMemoryTracking=summary carries 5–10% performance overhead — not free. I'd recommend leaving it off in production and enabling it temporarily on a single node when investigating an incident. If your team insists on always-on memory diagnostics, that's fine, but be honest in review that this is the cost.
+Now the per-flag justification:
+
+GC Logging — Line 102
+Flag: -Xlog:gc*,gc+heap=debug,gc+age=trace,safepoint:file=/data/mrx/log/gc-%t.log:time,uptime,level,tags:filecount=20,filesize=100M
+What it does: Configures the JVM's unified logging system to write GC and safepoint events to a rotating set of files.
+Why this value:
+
+gc* captures every GC-related event at default (info) level — pause times, causes, heap before/after.
+gc+heap=debug adds heap region detail — eden/survivor/old/humongous occupancy per GC. Essential for diagnosing G1 behavior; without it you cannot tell whether a problem is young-gen pressure, old-gen pressure, or humongous-object pressure.
+gc+age=trace adds tenuring distribution — how old objects are when promoted to old gen. Catches survivor-space sizing problems.
+safepoint captures all stop-the-world pause events. Not all "GC pauses" are caused by GC — biased lock revocation, code deoptimization, and JVMTI agents (Dynatrace OneAgent injects via JVMTI) also cause safepoint pauses. Without this you may chase the wrong cause.
+time,uptime,level,tags — minimum useful decorators. time for correlation with Dynatrace and Splunk, uptime for correlating GC events with each other, tags for greppability.
+filecount=20,filesize=100M — 2GB of rolling history. Enough to cover several days of normal operation or capture context around an incident.
+
+Overhead: under 0.1% in measured workloads. Effectively free.
+Risk if removed: zero forward observability. The application is a black box at GC level, which is exactly the position you were in when you got rolled back the first time.
+
+G1 Tuning — Lines 103–106
+-XX:-G1UseAdaptiveIHOP (line 103)
+What it does: Disables Java 9+ adaptive heuristics for when G1 starts a concurrent marking cycle. Returns G1 to the Java-8-style fixed-threshold behavior.
+Why disable it: Adaptive IHOP tries to predict allocation rate and start marking "just in time." In bursty workloads — which most Kafka/MQ message processors are — it can underestimate and start marking too late, allowing old gen to fill during the mark cycle. The result is a concurrent mode failure, which falls back to Full GC, which is what you want to avoid. Disabling adaptive returns to predictable behavior matching what worked on Java 8.
+Risk: You give up some peak throughput in steady-state workloads where adaptive would have made better choices. For a message-driven app with variable load, the predictability is worth the trade.
+Reversibility: Once stable on Java 21 with this flag, you can re-enable adaptive in a controlled experiment to see whether it improves throughput.
+-XX:InitiatingHeapOccupancyPercent=35 (line 104)
+What it does: When old gen occupancy crosses this percentage of total heap, G1 starts a concurrent marking cycle.
+Why 35 (not the Java 8 default of 45):
+
+Default 45 was acceptable on Java 8 because the application clearly didn't accumulate old-gen pressure fast enough to outrun it.
+On Java 21, the surrounding G1 internals are different (mixed GC scheduling, humongous handling, RSet management). 35 gives extra margin: marking starts earlier, so old gen has more time to be reclaimed before it fills.
+On a 24GB heap, 35% = 8.4GB. Starting marking when old gen reaches that level still leaves ~15GB of headroom — plenty of time for marking to complete even under heavy allocation.
+
+Risk if too low (e.g., 25): Concurrent marking cycles run constantly, wasting CPU.
+Risk if too high (e.g., 60): Marking starts too late, old gen fills during marking, concurrent mode failure, Full GC.
+Tuning direction: If GC logs show concurrent marks completing with old gen still mostly empty, raise to 40 then 45. If they show marks starting and then concurrent mode failure, lower.
+-XX:G1HeapRegionSize=16M (line 105)
+What it does: Forces G1 region size to 16MB instead of the auto-calculated value.
+Why 16M:
+
+Auto-calculation for 24GB heap: 24576MB / 2048 ≈ 12MB, rounded down to power of 2 = 8MB.
+Any object larger than 50% of a region is treated as "humongous" — allocated directly in old gen, often spanning multiple contiguous regions, reclaimed less efficiently.
+With 8MB regions, anything > 4MB is humongous. With 16MB regions, the threshold rises to 8MB.
+Kafka message batches, MQ payloads, and serialized objects can easily reach 4–8MB in financial / message-processing applications. At 8MB regions they'd be humongous; at 16MB they're normal old-gen allocations.
+
+Risk if too small: Humongous allocations fragment the heap and stress G1's special-case handling.
+Risk if too large (e.g., 32M): Fewer regions overall (24GB / 32MB = 768 regions), less granular reclamation, larger evacuation work per GC.
+How to validate: GC logs include humongous allocation counts. If you see consistent humongous activity, the region size is too small relative to your actual object sizes. Use a heap histogram to confirm: jcmd <pid> GC.class_histogram | head -30 shows the largest classes by retained size.
+-XX:G1ReservePercent=15 (line 106)
+What it does: Reserves 15% of heap as a safety buffer that G1 will never allocate from for application use. Used to copy survivors during evacuation pauses.
+Why 15 (not the default 10):
+
+During a young GC, surviving objects are copied out of Eden into Survivor and Old. If there are no free regions to copy into, G1 has to declare "to-space exhaustion" and degrade — usually preceding OOM.
+10% on a 24GB heap = 2.4GB reserve. 15% = 3.6GB.
+Your application demonstrably runs near the heap ceiling (Dynatrace shows 13–14GB used on Java 8 with 24GB heap, that's heap utilization peaks of 60%+). The extra 1.2GB reserve costs little but protects against the failure mode that caused your production incident.
+
+Risk if too low: To-space exhaustion → degraded GC → OOM.
+Risk if too high: Effective heap is smaller, more frequent GCs.
+Trade-off acknowledgement for your review: at 15%, your effective application heap is 24GB × 0.85 = 20.4GB instead of 21.6GB. You're trading 1.2GB of usable heap for protection against the exact failure that rolled you back. Worth it.
+
+Metaspace — Lines 107–109
+-XX:MetaspaceSize=256m (line 107)
+What it does: Initial size at which the first Metaspace GC is triggered. This is not a minimum; it's a threshold for the first cleanup pass.
+Why 256m: Default is platform-dependent (often ~21MB), which triggers Metaspace GCs early in startup. 256MB lets startup proceed without these cleanup pauses, since a typical Spring application loads several thousand classes immediately.
+Risk if too low: Startup-time GC churn.
+Risk if too high: Slightly slower first detection of Metaspace leaks during startup.
+-XX:MaxMetaspaceSize=1g (line 108)
+What it does: Hard cap on Metaspace. When reached, the JVM throws OutOfMemoryError: Metaspace.
+Why 1GB (you raised it from my suggested 512m):
+
+Default is unbounded. Unbounded is dangerous — a classloader leak will silently grow Metaspace until the kernel kills the container.
+512MB is comfortable for most Spring + Kafka + MQ applications (typical loaded classes: 30–50k, ~5–10KB each in Metaspace).
+1GB gives you ~2× headroom for dynamic class generation (CGLib proxies, hidden classes for lambdas, dynamic JSP/JSON serializer classes if applicable).
+
+Defense for 1GB over 512MB: if your application uses heavy bytecode generation (Hibernate proxies, dynamic SOAP clients, code-generated Kafka serializers), 512MB can be tight. 1GB is conservative and prevents a Metaspace OOM during a load spike that briefly generates more proxies than usual. The cost is 512MB of address space you might never use — acceptable on a 40GB VM.
+Risk if too low: OOM: Metaspace.
+Risk if too high: Slower detection of real Metaspace leaks (a leak that would have OOM'd at 512MB takes longer to surface at 1GB).
+Monitoring recommendation: alert on Metaspace used > 800MB. A real leak will grow steadily; legitimate working set should plateau within an hour of startup.
+-XX:CompressedClassSpaceSize=256m (line 109)
+What it does: Sub-region of Metaspace specifically for compressed class pointers (Klass*).
+Why 256m: Default is 1GB, which is far more than most applications need. 256MB is enough for ~30–40k classes (a typical Klass is ~4–8KB).
+Why bother capping it: It's a separately reserved virtual address space. Even unused, the default 1GB reservation is wasted. Trimming to 256MB returns that reservation to the JVM's general pool.
+Risk if too low: Class loading fails with OutOfMemoryError: Compressed class space.
+Sanity check: if your jcmd <pid> VM.metaspace shows compressed class space usage approaching 200MB, raise this back up.
+
+Non-Heap Memory Caps — Lines 110–112
+-XX:MaxDirectMemorySize=4g (line 110)
+What it does: Caps the total amount of memory ByteBuffer.allocateDirect() and friends can allocate.
+Why 4g (and why this flag is the most important on the page):
+
+Default = -Xmx. Without this flag, your JVM permits up to 24GB of off-heap direct memory on top of the 24GB heap. Total potential JVM footprint: 50+ GB on a 40GB VM. Kernel will SIGKILL the process before any Java OOM exception fires → no heap dump, no diagnostic evidence, just the symptom you experienced.
+This is, in my professional opinion, the most likely root cause of your Java 21 production OOM incident.
+Kafka clients heavily use direct memory for batching, compression, and network buffers. IBM MQ Java client allocates direct buffers for message I/O. Netty (which Kafka and many MQ wrappers use under the covers) uses pooled direct buffers that hold onto allocations aggressively.
+4GB is a starting estimate. Typical Kafka producer footprint: 100–500MB. Typical Kafka consumer footprint: 200MB–1GB. MQ client: 100–500MB. Netty pool overhead: variable. 4GB covers all this with margin.
+
+Risk if too low: OutOfMemoryError: Direct buffer memory. This is good — it's a clean Java OOM with a heap dump, telling you exactly that direct memory is the issue. Versus the silent kernel kill you got last time.
+Risk if too high: Same failure mode as having no cap. Defeats the purpose.
+How to validate the 4GB number: in staging, expose BufferPoolMXBean to Dynatrace (it shows direct memory used). Run a sustained load test. If steady-state direct memory used is below 2GB, you can safely lower the cap. If it climbs toward 4GB, raise it — but also investigate whether the growth is a leak.
+-XX:ReservedCodeCacheSize=512m (line 111)
+What it does: Caps the JIT compiler's code cache.
+Why 512m (vs default ~240m):
+
+Java 9 introduced segmented code cache (JEP 197) — three sub-regions for different code types. The total default of ~240MB is split, and any one segment can fill while the others have room.
+Spring applications compile thousands of methods. Hot Kafka/MQ message processors, Jackson serializers, and reflective accessors push code cache usage up. 240MB is frequently insufficient; 512MB is conservative for a complex enterprise app.
+When the code cache fills, the JIT stops compiling new code and may flush old code to make room. Performance degrades; CPU goes up as hot methods are de-optimized.
+
+Risk if too low: Application runs progressively slower as JIT capability degrades.
+Risk if too high: Wasted reservation (~270MB more than default). Negligible.
+Monitoring: alert on code cache used > 80% of ReservedCodeCacheSize.
+-Xss512k (line 112)
+What it does: Sets thread stack size to 512KB (default 1MB on 64-bit Linux).
+Why 512k:
+
+Each Java thread consumes one stack. Stack memory is committed per thread, not just reserved.
+Spring + Kafka + MQ applications typically run 200–800 threads (Spring task executors, Kafka consumer threads, MQ listener threads, HTTP worker pool, JMX, internal scheduler, etc.). At 1MB each, that's 200–800MB; at 512KB it's 100–400MB.
+512KB is more than enough for application code unless you have deeply recursive algorithms (recursive parsers, deeply nested JSON, recursive Spring AOP).
+
+Risk if too low: StackOverflowError in some code path that previously fit in 1MB.
+Risk if too high: Wasted memory in proportion to thread count.
+Validation step before deploying: run integration tests on staging with -Xss512k. If they pass, you're safe. Recursive code (if any) will fail loudly with StackOverflowError, not silently.
+
+Crash Handling — Line 113
+-XX:+ExitOnOutOfMemoryError
+What it does: When the JVM throws OutOfMemoryError, immediately terminate the process instead of trying to continue.
+Why enable it: After an OOM, the JVM is in an undefined state. Some handlers ran, others didn't. Locks may be held by dead threads. Application data structures may be partially mutated. Continuing leads to lurking corruption that's harder to diagnose than the original OOM. Better to die cleanly and let the orchestrator/wrapper restart you.
+Why this matters specifically for Tanuki wrapper: the wrapper monitors the Java process and restarts it on exit. With ExitOnOutOfMemoryError, OOM → clean process exit → wrapper restart → known-good state. Without it, the JVM zombie-walks and the wrapper's keepalive may report it as healthy.
+Risk: none beyond what OOM already does.
+
+Diagnostics — Line 114
+-XX:NativeMemoryTracking=summary
+What it does: Instruments every internal JVM allocation and categorizes it (Heap, Class, Thread, Code, GC, Compiler, etc.). Queryable at runtime via jcmd VM.native_memory summary.
+Why this is the controversial one on your list:
+
+It's enormously useful for diagnosing exactly the kind of incident you had.
+It carries 5–10% steady-state CPU overhead and additional memory overhead (~2 bytes per malloc).
+You stated you wanted conservative performance overhead. This contradicts that.
+
+My recommendation: disable for steady-state production. Enable it temporarily on a single canary node during the next migration attempt, capture an NMT baseline at startup, run for an hour under load, capture an NMT diff. Use the diff to validate the memory math. Then remove the flag.
+If your team insists on always-on, document the overhead in the review explicitly so it's an informed choice, not a surprise.
+
+What's Still Missing
+A few things you removed or never added that I'd put back in:
+-XX:ErrorFile=/data/mrx/log/hs_err_pid%p.log — when the JVM crashes natively (segfault, internal assertion, native library bug), it writes an hs_err file with thread states, GC info, and the crashing stack. By default this goes to the working directory, which in a wrapper deployment is often /. You want it where you can find it.
+-XX:MaxGCPauseMillis=200 — explicit declaration of the G1 pause target. Default is already 200ms but stating it removes ambiguity in review and prevents surprises if defaults change in a future Java update.
+-XX:ParallelGCThreads=N and -XX:ConcGCThreads=N/4 — set these explicitly to the actual core count of the VM. In a virtualized environment, the JVM may see host CPUs and pick an enormous thread count. For an 8-core VM: ParallelGCThreads=8 ConcGCThreads=2. For 16 cores: ParallelGCThreads=13 ConcGCThreads=3.
+-XX:G1PeriodicGCInterval=300000 (5 minutes) — Java 12+ feature that lets G1 do a concurrent cycle during idle and return committed memory to the OS. Useful if your application has quiet periods (overnight, between batches) and you want pod/VM RSS to drop. Optional. If your load is steady, skip it.
+JFR continuous recording — at settings=default it's ~1% overhead, well within your conservative budget, and the file is invaluable when an incident happens:
+-XX:StartFlightRecording=name=cont,settings=default,maxsize=512m,maxage=12h,dumponexit=true,filename=/data/mrx/log/jfr/
+For your migration scenario, this is much higher value-per-percent than NMT.
+
+Final Recommendation for Your Review
+Replace your line 114 (NMT) with the JFR line above, add the missing flags listed in the previous section, fix line 100, and add file= in the -Xlog line. The result is a config that's defensible point-by-point, has caps on every memory region that matters, doesn't depend on JVM defaults you didn't choose, and gives you forensic evidence the next time something breaks.
+Want me to write up the final version as a copy-pasteable block, with each line
