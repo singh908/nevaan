@@ -1,4 +1,7 @@
-3. You added NMT (line 114), which conflicts with your "conservative overhead" goal. NativeMemoryTracking=summary carries 5–10% performance overhead — not free. I'd recommend leaving it off in production and enabling it temporarily on a single node when investigating an incident. If your team insists on always-on memory diagnostics, that's fine, but be honest in review that this is the cost.
+cd C:\HeapDump_SPE\mat
+ParseHeapDump.bat C:\HeapDump_SPE\SPEHeapDumps org.eclipse.mat.api:suspects org.eclipse.mat.api:overview org.eclipse.mat.api:top_components
+
+
 Now the per-flag justification:
 
 GC Logging — Line 102
