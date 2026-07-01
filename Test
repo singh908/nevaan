@@ -1,0 +1,34 @@
+Subject: SPE general pod Pending at EOD — root cause and proposed fixes
+
+Hi all,
+
+Following up on the SPE general replica getting stuck in Pending after the EOD restart. I've traced it end to end. Summary: it's not a broken node or a gating issue — all three nodes are Ready and untainted. It's a scheduling/capacity problem with effectively zero slack, and the fixed pod start order can trigger it.
+
+The numbers (per node: 8 CPU, ~62 GiB allocatable):
+
+The platform stack (calico, illumio, kyverno, aquasec, dynatrace, flux, haproxy, monitoring, etc.) is not evenly spread, so the CPU left for SPE differs per node. Each SPE pod requests 2.2 CPU (2 main container + 0.2 sidecar). After the platform baseline:
+- eurvlii142704: ~1.4 CPU free -> can host 0 SPE pods (this is why it looks idle)
+- eurvlii142705: ~3.7 CPU free -> can host 1 SPE pod
+- eurvlii142706: ~5.6 CPU free -> can host 2 SPE pods (but not two 32Gi pods, see below)
+
+That's exactly 3 SPE slots for our 3 pods (profile, highmem, general) — no spare. On top of that, memory means two 32 GiB pods (general/highmem) can never share a node (32+32 > 62), so 706's two slots can only be "profile + one big pod".
+
+Why general (started last) pends:
+Pods start profile -> highmem -> general, and the scheduler places each greedily on whatever node has room at that moment, and never relocates. If profile happens to land on 705, it consumes 705's only slot; highmem then takes 706; and general is left with no node that has both 2.2 CPU and 32 GiB free -> Pending. It's intermittent because it depends purely on where the first pod (profile) lands.
+
+Why the manual fix works:
+Scaling profile down frees a slot, general schedules into it, then scaling profile back up finds room on a big-pod node. We're manually doing the relocation the scheduler won't.
+
+On the "limits over 100%" question: that's normal overcommit. Kubernetes schedules on requests, not limits; the sum of limits is allowed to exceed node capacity. CPU over 100% is harmless (containers just get throttled). Memory limits at ~103% on 706 is worth monitoring since RAM can't be throttled, but our SPE pods can't burst past their reservation, so the risk is from platform pods.
+
+Proposed fixes, in order:
+1. Right-size the SPE CPU request. Pods request 2 CPU but are Burstable (limit 4) — the 2-core reservation is likely well above real steady-state use for a batch engine. If kubectl top confirms low idle CPU, drop requests.cpu to ~750m-1000m and keep limits.cpu at 4. This frees CPU, makes 704 usable, and makes memory the clean constraint again. Likely eliminates the Pending on its own.
+2. Reverse the start order — bring up highmem and general before profile — so the two big pods claim nodes first and profile slots in afterwards.
+3. Add per-host topology spread / anti-affinity for deterministic placement, but only after step 1.
+4. Pin maxSurge: 0 / maxUnavailable: 1 on the deployments so a Helm image bump doesn't try to surge a second big pod with nowhere to land.
+5. If kubectl top shows the CPU requests are actually honest, this becomes a capacity conversation (larger node flavour or a dedicated SPE pool), since 8-core nodes are tight for 3 SPE pods plus the platform stack.
+
+I'll validate the actual CPU usage with kubectl top over the next EOD window before we change the requests. Happy to walk through the detail.
+
+Thanks,
+Rahul
